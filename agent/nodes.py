@@ -105,6 +105,10 @@ def select_discriminating_experiment(state: AgentState) -> dict:
         for key, entry in EXPERIMENT_BANK.items()
     )
 
+    already_run = {e["name"] for e in state["experiments_run"]}
+    remaining_bank = {k: v for k, v in EXPERIMENT_BANK.items() if k not in already_run}
+    bank_text = "\n".join(f"- {k}: {v['description']}" for k, v in remaining_bank.items())
+
     prompt = (
         f"Active hypotheses:\n{hypotheses_text}\n\n"
         f"Available experiments:\n{bank_text}\n\n"
@@ -181,18 +185,46 @@ def update_hypotheses(state: AgentState) -> dict:
     )
 
     result = structured_update_llm.invoke(prompt)
+    input_names = {h["name"] for h in hypotheses}
+    output_names = {h.name for h in result.updated_hypotheses}
 
+    if input_names != output_names:
+        missing = input_names - output_names
+        extra = output_names - input_names
+        raise ValueError(
+            f"Hypothesis name mismatch after LLM update. "
+            f"Missing: {missing or 'none'}. Unexpected new names: {extra or 'none'}."
+        )
+    existing_by_name = {h["name"]: h for h in hypotheses}
     updated = []
     for h in result.updated_hypotheses:
+        old_evidence = existing_by_name[h.name]["evidence"]
+        merged_evidence = old_evidence + [e for e in h.evidence if e not in old_evidence]
         updated.append({
             "name": h.name,
             "confidence": h.confidence,
             "status": h.status,
-            "evidence": h.evidence,
+            "evidence": merged_evidence,
         })
 
     print("Update justifications:")
     for h in result.updated_hypotheses:
         print(f"  - {h.name}: {h.evidence_relation} -> {h.status} | {h.justification}")
 
-    return {"hypotheses": updated}
+    history_entry = {
+    "experiment": latest_experiment["name"],
+    "updates": [
+        {
+            "name": h.name,
+            "evidence_relation": h.evidence_relation,
+            "justification": h.justification,
+            "status": h.status,
+        }
+        for h in result.updated_hypotheses
+    ],
+}
+
+    return {
+        "hypotheses": updated,
+        "update_history": state.get("update_history", []) + [history_entry],
+    }
