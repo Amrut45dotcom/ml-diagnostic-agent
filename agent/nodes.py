@@ -200,9 +200,17 @@ def update_hypotheses(state: AgentState) -> dict:
     for h in result.updated_hypotheses:
         old_evidence = existing_by_name[h.name]["evidence"]
         merged_evidence = old_evidence + [e for e in h.evidence if e not in old_evidence]
+
+        confidence = h.confidence
+
+        if h.status == "ruled_out":
+            confidence = min(confidence, 0.15)
+        elif h.status == "confirmed":
+            confidence = max(confidence, 0.85)
+
         updated.append({
             "name": h.name,
-            "confidence": h.confidence,
+            "confidence": confidence,
             "status": h.status,
             "evidence": merged_evidence,
         })
@@ -228,3 +236,23 @@ def update_hypotheses(state: AgentState) -> dict:
         "hypotheses": updated,
         "update_history": state.get("update_history", []) + [history_entry],
     }
+
+
+def should_continue(state: AgentState) -> str:
+    hypotheses = state["hypotheses"]
+    active = [h for h in hypotheses if h["status"] == "active"]
+    round_count = len(state.get("experiments_run", []))
+
+    MAX_ROUNDS = 5
+
+    if len(active) <= 1:
+        return "end"
+
+    if round_count >= MAX_ROUNDS:
+        return "end"
+
+    experiments_run_names = {e["name"] for e in state["experiments_run"]}
+    if experiments_run_names >= set(EXPERIMENT_BANK.keys()):
+        return "end"
+
+    return "continue"
