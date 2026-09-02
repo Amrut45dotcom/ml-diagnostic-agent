@@ -1,6 +1,6 @@
-from typing import Dict, Literal, Annotated, List
+from typing import Dict, Literal, Annotated, List, Optional
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from state import AgentState
 from langchain_groq import ChatGroq
 import os
@@ -14,10 +14,17 @@ load_dotenv()
 api_key = os.getenv("GROQ_API_KEY")
 
 class HypothesisOutput(BaseModel):
-    name: str
+    name: Literal["high_lr", "label_noise", "overfitting", "data_leak", "dist_mismatch", "other"]
+    other_description: Optional[str] = None
     confidence: Annotated[float, Field(gt=0, lt=1)]
     status: Literal["active", "ruled_out", "confirmed"]
     evidence: list[str]
+
+    @model_validator(mode="after")
+    def check_other_has_description(self):
+        if self.name == "other" and not self.other_description:
+            raise ValueError("other_description is required when name is 'other'")
+        return self
 
 class HypothesesOutput(BaseModel):
     hypotheses: list[HypothesisOutput]
@@ -77,7 +84,8 @@ def generate_hypotheses(state: AgentState) -> dict:
             "name": h.name,
             "confidence": h.confidence,
             "status": h.status,
-            "evidence": h.evidence
+            "evidence": h.evidence,
+            "other_description": h.other_description
         }
 
         hypotheses.append(hypothesis)
@@ -96,9 +104,11 @@ def select_discriminating_experiment(state: AgentState) -> dict:
         raise ValueError("No active hypotheses to discriminate between")
 
     hypotheses_text = "\n".join(
-        f"- {h['name']} (confidence: {h['confidence']}): {', '.join(h['evidence'])}"
-        for h in active
-    )
+    f"- {h['name']}"
+    + (f" ({h['other_description']})" if h['name'] == "other" and h.get('other_description') else "")
+    + f" (confidence: {h['confidence']}): {', '.join(h['evidence'])}"
+    for h in active
+)
 
     bank_text = "\n".join(
         f"- {key}: {entry['description']}"
@@ -142,12 +152,20 @@ def run_experiment(state: AgentState) -> dict:
 
 
 class UpdatedHypothesis(BaseModel):
-    name: str
+    name: Literal["high_lr", "label_noise", "overfitting", "data_leak", "dist_mismatch", "other"]
+    other_description: Optional[str] = None
     confidence: Annotated[float, Field(gt=0, lt=1)]
     status: Literal["active", "ruled_out", "confirmed"]
     evidence: list[str]
     evidence_relation: Literal["supports", "contradicts", "unrelated"]
     justification: str  # explicit reasoning for THIS update, forced
+
+    @model_validator(mode="after")
+    def check_other_has_description(self):
+        if self.name == "other" and not self.other_description:
+            raise ValueError("other_description is required when name is 'other'")
+        return self
+
 
 class UpdatedHypothesesOutput(BaseModel):
     updated_hypotheses: list[UpdatedHypothesis]
@@ -164,7 +182,9 @@ def update_hypotheses(state: AgentState) -> dict:
     latest_experiment = state["experiments_run"][-1]
 
     hypotheses_text = "\n".join(
-        f"- {h['name']} (current status: {h['status']}, confidence: {h['confidence']}): "
+        f"- {h['name']}"
+        + (f" ({h['other_description']})" if h['name'] == "other" and h.get('other_description') else "")
+        + f" (current status: {h['status']}, confidence: {h['confidence']}): "
         f"{', '.join(h['evidence'])}"
         for h in hypotheses
     )
