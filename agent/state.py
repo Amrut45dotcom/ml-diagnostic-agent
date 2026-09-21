@@ -6,6 +6,7 @@ class Hypothesis(TypedDict):
     confidence: float
     status: str
     evidence: List[str]
+    other_description: Optional[str]
 
 
 class Experiment(TypedDict):
@@ -16,7 +17,8 @@ class Experiment(TypedDict):
 class AgentState(TypedDict):
     filepath: str
     accuracy_filepath: str
-    target_lr : float
+    run_key_column: str
+    run_key: str  
     metrics_summary: str
     raw_metrics: List[Dict]
 
@@ -29,3 +31,5 @@ class AgentState(TypedDict):
     budget: int
 
     conclusion: Optional[str]
+
+    update_history: List[Dict]
