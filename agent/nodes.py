@@ -3,7 +3,11 @@ import pandas as pd
 from pydantic import BaseModel, Field, model_validator
 from state import AgentState
 from langchain_groq import ChatGroq
+from langchain_core.exceptions import OutputParserException
 import os
+from labels import LABEL_DESCRIPTIONS
+LABEL_GUIDE = "\n".join(f"- {k}: {v}" for k, v in LABEL_DESCRIPTIONS.items())
+REQUIRED_LABELS = {"high_lr", "label_noise", "overfitting", "data_leak", "dist_mismatch"}
 
 
 from bank import EXPERIMENT_BANK
@@ -13,6 +17,25 @@ from dotenv import load_dotenv
 load_dotenv()
 api_key = os.getenv("GROQ_API_KEY")
 
+
+import time
+from groq import RateLimitError
+
+def invoke_with_retry(llm_runnable, prompt, max_attempts=3):
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return llm_runnable.invoke(prompt)
+        except OutputParserException as e:
+            last_error = e
+            print(f"Structured output parse failed (attempt {attempt+1}/{max_attempts}), retrying...")
+        except RateLimitError as e:
+            last_error = e
+            wait_time = 5
+            print(f"Rate limit hit (attempt {attempt+1}/{max_attempts}), waiting {wait_time}s...")
+            time.sleep(wait_time)
+    raise last_error
+
 class HypothesisOutput(BaseModel):
     name: Literal["high_lr", "label_noise", "overfitting", "data_leak", "dist_mismatch", "other"]
     other_description: Optional[str] = None
@@ -20,40 +43,89 @@ class HypothesisOutput(BaseModel):
     status: Literal["active", "ruled_out", "confirmed"]
     evidence: list[str]
 
+
     @model_validator(mode="after")
     def check_other_has_description(self):
-        if self.name == "other" and not self.other_description:
-            raise ValueError("other_description is required when name is 'other'")
+        if self.name == "other":
+            desc = (self.other_description or "").strip().lower()
+            if not desc or desc == "none":
+                raise ValueError("other_description is required when name is 'other'")
         return self
 
-class HypothesesOutput(BaseModel):
-    hypotheses: list[HypothesisOutput]
+class HypothesisListOutput(BaseModel):
+    hypotheses: list[HypothesisOutput] = Field(..., min_length=5, max_length=6)
+
+    @model_validator(mode="after")
+    def check_label_coverage(self):
+        names = [h.name for h in self.hypotheses]
+        name_set = set(names)
+
+        required = {"high_lr", "label_noise", "overfitting", "data_leak", "dist_mismatch"}
+        missing = required - name_set
+        if missing:
+            raise ValueError(f"Missing required hypotheses: {missing}")
+
+        if len(names) != len(name_set):
+            raise ValueError("Duplicate hypothesis names in output")
+
+        return self
+        
+# class HypothesesOutput(BaseModel):
+#     hypotheses: list[HypothesisOutput] =Field(..., min_length=5, max_length=6)
+ 
+#     @model_validator(mode="after")
+#     def check_label_coverage(self):
+#         names = [h.name for h in self.hypotheses]
+#         name_set = set(names)
+ 
+#         missing = REQUIRED_LABELS - name_set
+#         if missing:
+#             raise ValueError(f"Missing required hypotheses: {missing}")
+ 
+#         if len(names) != len(name_set):
+#             raise ValueError("Duplicate hypothesis names in output")
+ 
+#         return self
+ 
+    
 
 class ExperimentSelection(BaseModel):
     selected_key: BankKey
     reasoning: str
 
 def inspect_metrics(state: AgentState) -> dict:
-
     filepath = state["filepath"]
     accuracy_filepath = state["accuracy_filepath"]
-    target_lr = state["target_lr"]  # the "sick" run under diagnosis
+    run_key_column = state["run_key_column"]
+    run_key = state["run_key"]
 
     df = pd.read_csv(filepath)
     accuracy_df = pd.read_csv(accuracy_filepath)
 
-    group = df[df["lr"] == target_lr].sort_values("epoch")
-    accuracy = accuracy_df.loc[accuracy_df["lr"] == target_lr, "test_accuracy"].iloc[0]
+    group = df[df[run_key_column] == run_key].sort_values("epoch")
+    accuracy_row = accuracy_df.loc[accuracy_df[run_key_column] == run_key].iloc[0]
+
+    accuracy = accuracy_row["test_accuracy"]
+
+    
+    extra_columns = [
+        col for col in accuracy_df.columns
+        if col not in (run_key_column, "test_accuracy")
+    ]
+    extra_metrics_text = ", ".join(
+        f"{col} {accuracy_row[col]:.2f}%" for col in extra_columns
+    )
 
     first = group.iloc[0]
     final = group.iloc[-1]
 
     summary = (
-        f"LR={target_lr}: "
+        f"{run_key_column}={run_key}: "
         f"train_loss {first['train_loss']:.3f} -> {final['train_loss']:.3f}, "
         f"val_loss {first['val_loss']:.3f} -> {final['val_loss']:.3f}, "
         f"grad_norm {first['gradient_norm']:.3f} -> {final['gradient_norm']:.3f}, "
         f"test_accuracy {accuracy:.2f}%"
+        + (f", {extra_metrics_text}" if extra_metrics_text else "")
     )
 
     return {
@@ -61,21 +133,37 @@ def inspect_metrics(state: AgentState) -> dict:
         "raw_metrics": group.to_dict(orient="records")
     }
 
+
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     temperature=0
 )
 
 structured_llm = llm.with_structured_output(
-    HypothesesOutput,
+    HypothesisListOutput,
     method="json_schema"
 )
 
 
+
 def generate_hypotheses(state: AgentState) -> dict:
     summary = state["metrics_summary"]
-
-    result = structured_llm.invoke(summary)
+    prompt = (
+        "You are diagnosing an ML training pathology from the metrics below.\n"
+        "Each hypothesis you generate must use `name` from exactly one of these categories:\n"
+        f"{LABEL_GUIDE}\n"
+        "- other: use only if none of the above fit; you MUST fill other_description "
+        "with a specific free-text explanation of what you actually observed.\n\n"
+        f"Training metrics:\n{summary}\n\n"
+        "You must generate exactly one hypothesis for each of the following categories, "
+        f"even if you assign it low confidence: {', '.join(sorted(REQUIRED_LABELS))}.\n"
+        "Generate hypotheses for what is causing the observed behavior.\n"
+        "For the 'other' category, if you find no additional pathology beyond the "
+        "categories listed above, still provide a specific other_description explaining "
+        "what you checked and ruled out — do not write 'None' or leave it generic."
+    )
+    # result = structured_llm.invoke(prompt)
+    result = invoke_with_retry(structured_llm, prompt)
 
     hypotheses = []
 
@@ -99,6 +187,9 @@ def generate_hypotheses(state: AgentState) -> dict:
 
 def select_discriminating_experiment(state: AgentState) -> dict:
     active = [h for h in state["hypotheses"] if h["status"] == "active"]
+    if not active:
+            candidates = sorted(state["hypotheses"], key=lambda h: h["confidence"], reverse=True)
+            active = [candidates[0]]
 
     if not active:
         raise ValueError("No active hypotheses to discriminate between")
@@ -128,9 +219,9 @@ def select_discriminating_experiment(state: AgentState) -> dict:
 
     structured_experiment_llm = llm.with_structured_output(
     ExperimentSelection,
-    method="function_calling"
+    method="json_schema"
     )
-    result = structured_experiment_llm.invoke(prompt)
+    result = invoke_with_retry(structured_experiment_llm, prompt)
 
     print("Selection reasoning:", result.reasoning)
 
@@ -162,8 +253,10 @@ class UpdatedHypothesis(BaseModel):
 
     @model_validator(mode="after")
     def check_other_has_description(self):
-        if self.name == "other" and not self.other_description:
-            raise ValueError("other_description is required when name is 'other'")
+        if self.name == "other":
+            desc = (self.other_description or "").strip().lower()
+            if not desc or desc == "none":
+                raise ValueError("other_description is required when name is 'other'")
         return self
 
 
@@ -190,21 +283,35 @@ def update_hypotheses(state: AgentState) -> dict:
     )
 
     prompt = (
+        f"Category meanings:\n{LABEL_GUIDE}\n\n"
         f"Current hypotheses:\n{hypotheses_text}\n\n"
         f"New experiment result — {latest_experiment['name']}:\n"
         f"{latest_experiment['result_summary']}\n\n"
         "For EVERY hypothesis above, you must explicitly decide whether this new "
-        "evidence SUPPORTS it, CONTRADICTS it, or is UNRELATED to it. "
+        "evidence SUPPORTS it, CONTRADICTS it, or is UNRELATED to it.\n"
+        "Reasoning check: if an experiment that directly manipulates the variable named "
+        "in a hypothesis (e.g. changing the learning rate for the high_lr hypothesis) "
+        "resolves the problem, that SUPPORTS the hypothesis — it does not contradict it. "
+        "A hypothesis is only contradicted if the manipulation was tried and the problem "
+        "persisted anyway.\n"
         "Do not leave a hypothesis unchanged unless you can justify in one sentence "
         "why the new evidence doesn't affect it. "
         "A hypothesis can only stay 'active' if you state a specific, unresolved "
         "question about it. If evidence contradicts a hypothesis, mark it "
         "'ruled_out' — do not keep contradicted hypotheses active out of caution. "
         "If evidence strongly and specifically supports a hypothesis with no "
-        "remaining ambiguity, mark it 'confirmed'."
+        "remaining ambiguity, mark it 'confirmed'. "
+        "If a hypothesis has name 'other' and its status is 'ruled_out' with no new "
+        "relevant evidence this round, you must still repeat its existing other_description "
+        "exactly as given — do not omit it or set it to null, even if you have nothing new to add."
+        "For data_leak specifically: focus on whether the GAP between leaked_subset_accuracy "
+        "and non_leaked_accuracy closes after a clean-split retrain — not on whether overall "
+        "test_accuracy stays high. A closed gap with continued high accuracy CONFIRMS the "
+        "leak was real and has been removed; it does not disprove the leak."
+        "If evidence_relation is 'unrelated', keep the hypothesis's status unchanged from its current value."
     )
 
-    result = structured_update_llm.invoke(prompt)
+    result = invoke_with_retry(structured_update_llm, prompt)
     input_names = {h["name"] for h in hypotheses}
     output_names = {h.name for h in result.updated_hypotheses}
 
@@ -228,11 +335,16 @@ def update_hypotheses(state: AgentState) -> dict:
         elif h.status == "confirmed":
             confidence = max(confidence, 0.85)
 
+        old_desc = existing_by_name[h.name].get("other_description")
+        new_desc = (h.other_description or "").strip()
+        final_desc = new_desc if new_desc and new_desc.lower() != "none" else old_desc
+
         updated.append({
             "name": h.name,
             "confidence": confidence,
             "status": h.status,
             "evidence": merged_evidence,
+            "other_description": final_desc
         })
 
     print("Update justifications:")
@@ -265,14 +377,14 @@ def should_continue(state: AgentState) -> str:
 
     MAX_ROUNDS = 5
 
-    if len(active) <= 1:
-        return "end"
-
     if round_count >= MAX_ROUNDS:
         return "end"
 
     experiments_run_names = {e["name"] for e in state["experiments_run"]}
     if experiments_run_names >= set(EXPERIMENT_BANK.keys()):
+        return "end"
+
+    if len(active) <= 1 and round_count > 0:
         return "end"
 
     return "continue"
